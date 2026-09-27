@@ -72,10 +72,10 @@ fn step5_shapes() {
 }
 
 fn step6_byte_slicing() {
-    let n: u32 = 4_29_49_67_295;
-    let bytes: [u8; 4] = n.to_le_bytes();
+    let n: u64 = 4_29_49_67_295;
+    let bytes: [u8; 8] = n.to_le_bytes();
     println!("{bytes:?}"); // [255, 255, 255, 255]
-    let back = u32::from_le_bytes(bytes);
+    let back = u64::from_le_bytes(bytes);
     assert_eq!(back, n);
 
     let buf = vec![1, 2, 3, 4, 255];
