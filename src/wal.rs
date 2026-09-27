@@ -155,6 +155,17 @@ mod tests {
     }
 
     #[test]
+    fn truncate_incomplete_payload() {
+        let entry = WalEntry::Put {
+            key: b"test".to_vec(),
+            value: b"test".to_vec(),
+        };
+
+        let bytes = encode_entry(&entry);
+        let result = decode_entry(&bytes[..10]);
+        assert!(matches!(result, Err(crate::Error::Corruption(_))));
+    }
+    #[test]
     fn put_round_trips() {
         let entry = WalEntry::Put {
             key: b"hello".to_vec(),
