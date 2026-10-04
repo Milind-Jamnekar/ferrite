@@ -158,7 +158,7 @@ impl Wal {
                     pos += consumed;
                 }
                 Err(e) => {
-                    //check reamining bytes from files
+                    // fewer than a full header left: torn tail from a crash mid-write
                     if data.len() - pos < 8 {
                         break;
                     }
@@ -169,10 +169,12 @@ impl Wal {
                             .expect("Error extracting in entry_len"),
                     ) as usize;
 
+                    // bytes exist after this bad entry, so later appends succeeded:
                     if pos + 8 + entry_len < data.len() {
                         return Err(e);
                     }
 
+                    // bad entry reaches EOF
                     break;
                 }
             }
