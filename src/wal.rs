@@ -1,3 +1,6 @@
+use std::io::Write;
+
+#[derive(Debug)]
 pub enum WalEntry {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
@@ -119,6 +122,66 @@ pub fn decode_entry(bytes: &[u8]) -> crate::Result<(WalEntry, usize)> {
     Ok((entry, 8 + entry_len))
 }
 
+pub struct Wal {
+    file: std::fs::File,
+}
+
+impl Wal {
+    pub fn create(path: &std::path::Path) -> crate::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Self { file })
+    }
+    pub fn open_append(path: &std::path::Path) -> crate::Result<Self> {
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
+        Ok(Self { file })
+    }
+    pub fn append(&mut self, entry: &WalEntry) -> crate::Result<()> {
+        // encodes + writes + fsyncs
+        let bytes = encode_entry(entry);
+        self.file.write_all(&bytes)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+    pub fn replay(path: &std::path::Path) -> crate::Result<Vec<WalEntry>> {
+        // read the whole file into memory
+        let data = std::fs::read(path)?;
+        let mut entries = Vec::new();
+        let mut pos = 0;
+
+        while pos < data.len() {
+            match decode_entry(&data[pos..]) {
+                Ok((entry, consumed)) => {
+                    entries.push(entry);
+                    pos += consumed;
+                }
+                Err(e) => {
+                    //check reamining bytes from files
+                    if data.len() - pos < 8 {
+                        break;
+                    }
+
+                    let entry_len = u32::from_le_bytes(
+                        data[pos + 4..pos + 8]
+                            .try_into()
+                            .expect("Error extracting in entry_len"),
+                    ) as usize;
+
+                    if pos + 8 + entry_len < data.len() {
+                        return Err(e);
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +273,123 @@ mod tests {
         bytes[last] ^= 0xFF;
         let result = decode_entry(&bytes);
         assert!(matches!(result, Err(crate::Error::Corruption(_))));
+    }
+
+    #[test]
+    fn replay_short_torn_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+
+        let mut wal: Wal = Wal::create(&path).unwrap();
+        wal.append(&WalEntry::Put {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+        })
+        .unwrap();
+        let new_bytes: [u8; 3] = [1, 2, 3];
+        let mut good_bytes: Vec<u8> = std::fs::read(&path).expect("Error in reading file");
+        good_bytes.extend_from_slice(&new_bytes);
+        std::fs::write(&path, good_bytes).expect("Error on writing file");
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn replay_first_entry_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+
+        let mut wal: Wal = Wal::create(&path).unwrap();
+        wal.append(&WalEntry::Put {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+        })
+        .unwrap();
+
+        wal.append(&WalEntry::Put {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+        })
+        .unwrap();
+
+        let mut bytes: Vec<u8> = std::fs::read(&path).expect("Error in reading file");
+        bytes[10] ^= 0xFF;
+        std::fs::write(&path, bytes).expect("Error on writing file");
+
+        let entries = Wal::replay(&path);
+        assert!(matches!(entries, Err(crate::Error::Corruption(_))));
+    }
+
+    #[test]
+    fn append_then_replay_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+
+        let mut wal: Wal = Wal::create(&path).unwrap();
+        wal.append(&WalEntry::Put {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+        })
+        .unwrap();
+        wal.append(&WalEntry::Delete { key: b"b".to_vec() })
+            .unwrap();
+        drop(wal);
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn replay_discards_torn_final_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+
+        let mut wal = Wal::create(&path).unwrap();
+        wal.append(&WalEntry::Put {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+        })
+        .unwrap();
+        drop(wal);
+
+        // simulate a crash mid-write: append a second, well-formed entry,
+        // then truncate the file partway through it
+        let good_bytes = encode_entry(&WalEntry::Put {
+            key: b"b".to_vec(),
+            value: b"2".to_vec(),
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&good_bytes[..good_bytes.len() - 2]).unwrap(); // drop last 2 bytes
+
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 1); // only the first, complete entry survives
+    }
+
+    #[test]
+    fn open_append_adds_to_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+
+        Wal::create(&path)
+            .unwrap()
+            .append(&WalEntry::Put {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            })
+            .unwrap();
+
+        let mut wal = Wal::open_append(&path).unwrap();
+        wal.append(&WalEntry::Put {
+            key: b"b".to_vec(),
+            value: b"2".to_vec(),
+        })
+        .unwrap();
+        drop(wal);
+
+        assert_eq!(Wal::replay(&path).unwrap().len(), 2);
     }
 }
